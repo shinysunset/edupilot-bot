@@ -11,8 +11,10 @@ from telegram.ext import (
 )
 
 
-TELEGRAM_TOKEN = "8622003523:AAEHdrAKCuPGnlgQt2tsECQ2cWL8jMcH2OY"
-GROQ_API_KEY = "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"
+import os
+
+TELEGRAM_TOKEN = os.environ.get("8622003523:AAEHdrAKCuPGnlgQt2tsECQ2cWL8jMcH2OY")
+GROQ_API_KEY = os.environ.get("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")
 
 
 client = Groq(api_key=GROQ_API_KEY)
