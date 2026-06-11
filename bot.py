@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2026-06-11-final-polished"
+BOT_VERSION = "2026-06-11-math-symbols-v2"
 TELEGRAM_MESSAGE_LIMIT = 3900
 
 
@@ -206,6 +206,13 @@ class CognitiveBoundaryManager:
             return None
 
         normalized = self._replace_number_words(low)
+        # Убираем вводные слова перед простой проверкой вычисления: "Проверь: 7 * 8 = 54?".
+        # Это не меняет логику CBM, а только позволяет безопасно проверить короткую арифметику.
+        normalized = re.sub(
+            r"\b(проверь|проверить|верно\s+ли|правильно\s+ли|посчитай|вычисли|сколько|чему\s+равно)\b\s*[:,-]?\s*",
+            " ",
+            normalized,
+        )
         replacements = [
             (r"умножить\s+на", "*"),
             (r"умножь\s+на", "*"),
@@ -349,8 +356,9 @@ class CognitiveBoundaryManager:
             "Если видно несколько задач, выбери ту, которая занимает основную часть изображения или выделена ближе всего к центру.\n"
             "Если часть текста неразборчива, напиши [неразборчиво] только в этом месте и сохрани всё, что читается.\n"
             "Если невозможно прочитать даже смысл условия, верни ровно OCR_FAILED.\n"
-            "Не используй markdown. Не используй LaTeX-синтаксис: не пиши $, \\angle, \\frac, \\cdot, \\leqslant, \\geqslant. "
-            "Пиши обычным текстом: угол C, 7/25, log_36(x), <=, >=, *. Не добавляй фразу 'на изображении'. Не решай задачу."
+            "Не используй markdown. Не используй LaTeX-синтаксис: не пиши $, \\angle, \\frac, \\cdot, \\leqslant, \\geqslant, \\sqrt, \\vec. "
+            "Пиши обычным текстом: угол C, 7/25, log_36(x), <=, >=, *, sqrt(x), root(5, x), векторы a и b. "
+            "Не добавляй фразу 'на изображении'. Не решай задачу."
         )
         response = client.chat.completions.create(
             model=model,
@@ -496,6 +504,11 @@ class CognitiveBoundaryManager:
         for src, dst in sorted(greek.items(), key=lambda item: len(item[0]), reverse=True):
             cleaned = cleaned.replace(src, dst)
 
+        # OCR иногда путает математическую π с русской буквой "п".
+        # Меняем только в явном математическом контексте: 13п/2, п/4, x + п / 4.
+        cleaned = re.sub(r"(?<=\d)\s*[пП](?=\s*(?:/|\)|\]|;|,|\+|-|\*|=|$))", "π", cleaned)
+        cleaned = re.sub(r"(?:(?<=^)|(?<=[\s\(\[=+\-*/;:,]))[пП](?=\s*/)", "π", cleaned)
+
         # Множества: \mathbb{R}, \mathbb{N} -> R, N.
         cleaned = re.sub(r"\\mathbb\s*\{\s*([A-Za-z])\s*\}", r"\1", cleaned)
         cleaned = re.sub(r"\\mathcal\s*\{\s*([A-Za-z])\s*\}", r"\1", cleaned)
@@ -535,9 +548,51 @@ class CognitiveBoundaryManager:
                 break
             cleaned = new_cleaned
 
-        # Корни: \sqrt{x}, \sqrt[3]{x}.
-        cleaned = re.sub(r"\\sqrt\[([^\[\]{}]+)\]\{([^{}]+)\}", r"root_\1(\2)", cleaned)
-        cleaned = re.sub(r"\\sqrt\{([^{}]+)\}", r"sqrt(\1)", cleaned)
+        # Корни: \sqrt{x}, \sqrt[3]{x}, \sqrt[15]{x}, √x, ∛x, ∜x, ⁵√x.
+        # Индекс корня сохраняется как root(n, выражение), чтобы не путать корень n-й степени с sqrt(n).
+        superscript_digits = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+
+        def _root_index(value: str) -> str:
+            value = (value or "").strip().translate(superscript_digits)
+            value = value.replace(" ", "")
+            value = value.strip("{}[]()")
+            return value or "n"
+
+        def _root_expr(value: str) -> str:
+            return (value or "").strip()
+
+        # LaTeX: \sqrt[n]{...} и \sqrt{...}.
+        nth_root_pattern = re.compile(r"\\sqrt\s*\[\s*([^\[\]{}]+?)\s*\]\s*\{\s*([^{}]+?)\s*\}")
+        for _ in range(8):
+            new_cleaned = nth_root_pattern.sub(lambda m: f"root({_root_index(m.group(1))}, {_root_expr(m.group(2))})", cleaned)
+            if new_cleaned == cleaned:
+                break
+            cleaned = new_cleaned
+        cleaned = re.sub(
+            r"\\sqrt\s*\[\s*([^\[\]{}]+?)\s*\]\s*([A-Za-zА-Яа-я0-9_]+)",
+            lambda m: f"root({_root_index(m.group(1))}, {_root_expr(m.group(2))})",
+            cleaned,
+        )
+        sqrt_pattern = re.compile(r"\\sqrt\s*\{\s*([^{}]+?)\s*\}")
+        for _ in range(8):
+            new_cleaned = sqrt_pattern.sub(lambda m: f"sqrt({_root_expr(m.group(1))})", cleaned)
+            if new_cleaned == cleaned:
+                break
+            cleaned = new_cleaned
+        cleaned = re.sub(r"\\sqrt\s*([A-Za-zА-Яа-я0-9_]+)", lambda m: f"sqrt({_root_expr(m.group(1))})", cleaned)
+
+        # Unicode-формы корней.
+        cleaned = re.sub(r"([⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*√\s*\(([^()]+)\)", lambda m: f"root({_root_index(m.group(1))}, {_root_expr(m.group(2))})", cleaned)
+        cleaned = re.sub(r"([⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*√\s*([A-Za-zА-Яа-я0-9_]+)", lambda m: f"root({_root_index(m.group(1))}, {_root_expr(m.group(2))})", cleaned)
+        cleaned = re.sub(r"∛\s*\(([^()]+)\)", lambda m: f"root(3, {_root_expr(m.group(1))})", cleaned)
+        cleaned = re.sub(r"∛\s*([A-Za-zА-Яа-я0-9_]+)", lambda m: f"root(3, {_root_expr(m.group(1))})", cleaned)
+        cleaned = re.sub(r"∜\s*\(([^()]+)\)", lambda m: f"root(4, {_root_expr(m.group(1))})", cleaned)
+        cleaned = re.sub(r"∜\s*([A-Za-zА-Яа-я0-9_]+)", lambda m: f"root(4, {_root_expr(m.group(1))})", cleaned)
+        cleaned = re.sub(r"√\s*\(([^()]+)\)", lambda m: f"sqrt({_root_expr(m.group(1))})", cleaned)
+        cleaned = re.sub(r"√\s*([A-Za-zА-Яа-я0-9_]+)", lambda m: f"sqrt({_root_expr(m.group(1))})", cleaned)
+
+        # Совместимость со старой очисткой root_5(x) -> root(5, x).
+        cleaned = re.sub(r"\broot_([A-Za-zА-Яа-я0-9]+)\s*\(([^()]+)\)", r"root(\1, \2)", cleaned)
 
         # Модули и нормы.
         cleaned = cleaned.replace(r"\lvert", "|").replace(r"\rvert", "|")
@@ -953,6 +1008,7 @@ def remember_task(user_id: int, task_text: str, source: str, user_message: str =
 async def send_long_message(update: Update, text: str) -> None:
     if not text:
         return
+    text = manager.clean_ocr_text(text)
     chunks: list[str] = []
     current = ""
     for paragraph in text.split("\n"):
@@ -1116,7 +1172,8 @@ async def level_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     get_state(uid)
-    user_message = update.message.text or ""
+    raw_user_message = update.message.text or ""
+    user_message = manager.clean_ocr_text(raw_user_message)
 
     simple_reply = manager.build_simple_arithmetic_reply(user_message)
     if simple_reply is not None:
