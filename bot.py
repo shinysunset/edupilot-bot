@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2026-06-11-cbm-photo-text-fix"
+BOT_VERSION = "2026-06-11-cbm-stable-v2"
 TELEGRAM_MESSAGE_LIMIT = 3900
 
 
@@ -113,6 +113,24 @@ class CognitiveBoundaryManager:
         text = (text or "").lower().replace("ё", "е")
         text = re.sub(r"\s+", " ", text).strip()
         return text
+
+    def is_groq_auth_error(self, exc: Exception) -> bool:
+        """Определяет ошибку неверного Groq API key без привязки к конкретному классу SDK."""
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return (
+            "authenticationerror" in text
+            or "invalid api key" in text
+            or "invalid_api_key" in text
+            or "401" in text
+            or "unauthorized" in text
+        )
+
+    def groq_auth_user_message(self) -> str:
+        return (
+            "Сейчас не работает доступ к ИИ-модели: неверный GROQ_API_KEY в Railway. "
+            "Я могу отвечать на простые локальные подсказки, но фото и умные разборы через LLM не заработают, "
+            "пока ключ Groq не будет заменён на действующий."
+        )
 
     # ----------------------------------------------------------
     #  Простая арифметика как безопасный промежуточный шаг
@@ -252,6 +270,72 @@ class CognitiveBoundaryManager:
 
         return f"{expr} = {value}. Если это часть задачи, пришли полное условие, и разберём следующий шаг."
 
+    def build_topic_explanation_reply(self, text: str) -> str | None:
+        """Локальная безопасная теория для очевидных учебных вопросов.
+
+        Нужна как резерв, если Groq временно недоступен. Она не выдаёт готовые
+        решения конкретных задач и не заменяет CBM-классификатор для спорных случаев.
+        """
+        low = self.normalize_text(text)
+        asks_method = any(marker in low for marker in [
+            "как решать", "как решить", "как их решать", "объясни", "расскажи", "метод"
+        ])
+        if not asks_method:
+            return None
+
+        if "квадрат" in low and "уравнен" in low:
+            return (
+                "Квадратные уравнения обычно решают так:\n"
+                "1. Приведи к виду ax^2 + bx + c = 0.\n"
+                "2. Найди коэффициенты a, b, c.\n"
+                "3. Посчитай дискриминант: D = b^2 - 4ac.\n"
+                "4. Если D > 0, будет два корня; если D = 0, один корень; если D < 0, действительных корней нет.\n"
+                "5. Потом подставь в формулы: x1 = (-b + sqrt(D))/(2a), x2 = (-b - sqrt(D))/(2a).\n\n"
+                "Пришли конкретное уравнение, и я помогу сделать первый шаг без готового списывания."
+            )
+
+        if "линейн" in low and "уравнен" in low:
+            return (
+                "Линейное уравнение решают по схеме: раскрыть скобки, перенести слагаемые с неизвестной в одну сторону, "
+                "числа — в другую, затем разделить на коэффициент перед неизвестной. "
+                "Пришли пример, и я проверю первый шаг."
+            )
+
+        if "неравен" in low:
+            return (
+                "Неравенство сначала нужно привести к удобному виду. Общая схема такая:\n"
+                "1. Найди область допустимых значений, если есть дроби, корни или логарифмы.\n"
+                "2. Перенеси всё в одну сторону.\n"
+                "3. Разложи выражение на множители или сделай замену, если вид повторяется.\n"
+                "4. Найди критические точки.\n"
+                "5. Используй метод интервалов.\n\n"
+                "Пришли конкретное неравенство, и начнём с ОДЗ или замены."
+            )
+
+        if "логариф" in low:
+            return (
+                "Логарифмические задачи начинаются с ОДЗ: основание логарифма положительно и не равно 1, "
+                "выражение под логарифмом положительно. После этого применяют свойства логарифмов и решают полученное уравнение или неравенство. "
+                "Пришли пример, и я помогу начать с ОДЗ."
+            )
+
+        if "процент" in low or "кредит" in low or "вклад" in low:
+            return (
+                "В задачах на проценты и кредиты удобно переводить проценты в коэффициент. "
+                "Рост на r% означает умножение на 1 + r/100, уменьшение на r% — на 1 - r/100. "
+                "Дальше по годам или месяцам записывают, как меняется величина. "
+                "Пришли условие, и мы составим первую строку схемы."
+            )
+
+        if "вектор" in low:
+            return (
+                "В задачах с векторами сначала находят координаты каждого вектора: конец минус начало. "
+                "Потом выполняют действия по координатам: например, 2a + b считается отдельно по x и по y. "
+                "Длина вектора с координатами (m; n) равна sqrt(m^2 + n^2)."
+            )
+
+        return None
+
     # ----------------------------------------------------------
     #  Обработка изображения
     # ----------------------------------------------------------
@@ -325,6 +409,9 @@ class CognitiveBoundaryManager:
                 last_text = text
             except Exception as exc:
                 last_error = exc
+                if self.is_groq_auth_error(exc):
+                    logger.error("Groq authentication failed during OCR. Check GROQ_API_KEY in Railway Variables.")
+                    raise RuntimeError("GROQ_AUTH_FAILED: invalid GROQ_API_KEY") from exc
                 logger.exception("OCR model failed: %s", model)
 
         if last_error:
@@ -483,8 +570,11 @@ LEARNING — студент задаёт учебный вопрос, проси
             if not reply:
                 raise RuntimeError("Empty model reply")
             return reply, new_attempt, intent
-        except Exception:
-            logger.exception("Generation error")
+        except Exception as exc:
+            if self.is_groq_auth_error(exc):
+                logger.error("Groq authentication failed during generation. Check GROQ_API_KEY in Railway Variables.")
+            else:
+                logger.exception("Generation error")
             return self.build_offline_reply(user_message, intent, attempt), new_attempt, intent
 
     # ----------------------------------------------------------
@@ -537,22 +627,52 @@ LEARNING — студент задаёт учебный вопрос, проси
             if not reply:
                 raise RuntimeError("Empty guided reply")
             return reply, new_attempt, intent
-        except Exception:
-            logger.exception("Guided reply generation error")
+        except Exception as exc:
+            if self.is_groq_auth_error(exc):
+                logger.error("Groq authentication failed during guided reply. Check GROQ_API_KEY in Railway Variables.")
+            else:
+                logger.exception("Guided reply generation error")
             return self.build_generic_guidance(task_text, intent, attempt), new_attempt, intent
 
     def build_generic_guidance(self, task_text: str, intent: str, attempt: int) -> str:
-        if intent == "CHEATING" and attempt <= 0:
-            return (
-                "Условие вижу, но готовое решение сразу не дам. "
-                "Начнём с анализа: что в задаче требуется найти? Выпиши неизвестную величину и данные, которые с ней связаны."
+        low = self.normalize_text(task_text)
+
+        if "кредит" in low or "вклад" in low or "руб" in low:
+            base = (
+                "Условие вижу: это финансовая задача. Начать нужно не с вычислений, а со схемы изменения долга или вклада. "
+                "Обозначь неизвестную величину, затем по каждому периоду запиши две операции: начисление процентов и платёж. "
+                "Первый учебный шаг: выпиши начальную сумму и формулу изменения за первый период."
             )
-        return (
-            "Условие вижу. Начать лучше с обозначений: выбери неизвестную величину, выпиши данные из условия "
-            "и составь первое соотношение. Пришли это соотношение, и я проверю следующий шаг."
-        )
+        elif "неравен" in low or ">" in task_text or "<" in task_text:
+            base = (
+                "Условие вижу: это неравенство. Начать нужно с области допустимых значений и удобной замены, если выражение повторяется. "
+                "Первый учебный шаг: перенеси всё в одну сторону и определи, какие значения переменной запрещены."
+            )
+        elif "уравнен" in low or "=" in task_text:
+            base = (
+                "Условие вижу: это уравнение или система. Начать нужно с определения неизвестных и проверки ограничений. "
+                "Первый учебный шаг: выпиши, какие переменные есть в условии, и какое уравнение связывает данные."
+            )
+        elif "вектор" in low or "координат" in low:
+            base = (
+                "Условие вижу: это задача на векторы. Начать нужно с координат векторов: конец минус начало. "
+                "Первый учебный шаг: найди координаты каждого вектора по клеткам, а уже потом считай нужную комбинацию."
+            )
+        else:
+            base = (
+                "Условие вижу. Начать лучше с обозначений: выбери неизвестную величину, выпиши данные из условия "
+                "и составь первое соотношение."
+            )
+
+        if intent == "CHEATING" and attempt <= 0:
+            return base + " Готовый ответ сразу не даю: напиши свой первый шаг, и я проверю."
+        return base + " Пришли этот первый шаг, и я помогу дальше."
 
     def build_offline_reply(self, user_message: str, intent: str, attempt: int) -> str:
+        topic_reply = self.build_topic_explanation_reply(user_message)
+        if topic_reply is not None:
+            return topic_reply
+
         if intent == "CHEATING":
             if attempt <= 0:
                 return (
@@ -774,6 +894,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_message(update, simple_reply)
         return
 
+    topic_reply = manager.build_topic_explanation_reply(user_message)
+    if topic_reply is not None:
+        user_attempts[uid] = 0
+        user_stats[uid]["learning"] += 1
+        append_history(uid, "user", user_message)
+        append_history(uid, "assistant", topic_reply)
+        await send_long_message(update, topic_reply)
+        return
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
@@ -897,6 +1026,8 @@ if __name__ == "__main__":
         raise RuntimeError("TELEGRAM_TOKEN is not set")
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set")
+    if not GROQ_API_KEY.startswith("gsk_"):
+        logger.warning("GROQ_API_KEY does not look like a standard Groq key. Check Railway Variables.")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
