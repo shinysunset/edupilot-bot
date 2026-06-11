@@ -372,94 +372,226 @@ class CognitiveBoundaryManager:
         return (response.choices[0].message.content or "").strip()
 
     def clean_ocr_text(self, text: str) -> str:
-        """Аккуратно убирает LaTeX-мусор из OCR, не меняя смысл задачи."""
+        """Аккуратно приводит OCR-вывод с LaTeX к читаемому тексту Telegram.
+
+        Функция не решает задачу и не меняет математический смысл. Она только
+        убирает технический LaTeX-синтаксис, который vision-модель иногда
+        возвращает вместе с условием: $, \\frac, \\vec, \\angle, \\leqslant и т.п.
+        """
         if not text:
             return text
 
         cleaned = text.strip()
 
-        # Убираем математические разделители, которые модель иногда оставляет из LaTeX.
+        # Нормализуем невидимые символы и типографику.
+        cleaned = cleaned.replace("\u00a0", " ")
+        cleaned = cleaned.replace("−", "-").replace("–", "-").replace("—", "-")
+        cleaned = cleaned.replace("×", "*").replace("·", "*").replace("÷", "/")
+        cleaned = cleaned.replace("≤", "<=").replace("≥", ">=").replace("≠", "!=")
+        cleaned = cleaned.replace("≈", "≈").replace("∼", "~")
+
+        # Убираем математические разделители LaTeX.
         cleaned = cleaned.replace("\\(", "").replace("\\)", "")
         cleaned = cleaned.replace("\\[", "").replace("\\]", "")
         cleaned = cleaned.replace("$", "")
 
-        # Окружения систем уравнений переводим в обычный текст.
-        cleaned = re.sub(r"\\begin\{cases\}", "система:\n", cleaned)
-        cleaned = re.sub(r"\\end\{cases\}", "", cleaned)
+        # LaTeX-окружения переводим в простой текст.
+        environment_replacements = {
+            r"\\begin\{cases\}": "система:\n",
+            r"\\end\{cases\}": "",
+            r"\\begin\{array\}\{[^{}]*\}": "",
+            r"\\end\{array\}": "",
+            r"\\begin\{matrix\}": "матрица:\n",
+            r"\\end\{matrix\}": "",
+            r"\\begin\{pmatrix\}": "матрица:\n",
+            r"\\end\{pmatrix\}": "",
+            r"\\begin\{bmatrix\}": "матрица:\n",
+            r"\\end\{bmatrix\}": "",
+            r"\\begin\{aligned\}": "",
+            r"\\end\{aligned\}": "",
+            r"\\begin\{align\*?\}": "",
+            r"\\end\{align\*?\}": "",
+        }
+        for pattern, repl in environment_replacements.items():
+            cleaned = re.sub(pattern, repl, cleaned)
         cleaned = cleaned.replace("\\\\", "\n")
+        cleaned = cleaned.replace("&", " ")
 
-        # Команды оформления.
-        cleaned = cleaned.replace("\\left", "").replace("\\right", "")
-        cleaned = cleaned.replace("\\,", " ").replace("\\;", " ").replace("\\:", " ")
+        # Команды оформления и пробелов.
+        formatting_commands = [
+            "\\left", "\\right", "\\big", "\\Big", "\\bigg", "\\Bigg",
+            "\\!", "\\,", "\\;", "\\:", "\\quad", "\\qquad",
+            "\\displaystyle", "\\textstyle", "\\scriptstyle", "\\scriptscriptstyle",
+        ]
+        for command in formatting_commands:
+            cleaned = cleaned.replace(command, " ")
+
+        # Текстовые оболочки: \text{...}, \mathrm{...}, \operatorname{...} -> содержимое.
+        text_wrappers = ["text", "mathrm", "mathbf", "mathit", "operatorname", "mbox"]
+        for wrapper in text_wrappers:
+            pattern = re.compile(rf"\\{wrapper}\{{([^{{}}]*)\}}")
+            for _ in range(6):
+                new_cleaned = pattern.sub(r"\1", cleaned)
+                if new_cleaned == cleaned:
+                    break
+                cleaned = new_cleaned
+
+        # Векторы и геометрические обозначения нужно обработать ДО удаления неизвестных команд.
+        # \vec{a}, \overrightarrow{AB}, \mathbf{a} -> a / AB.
+        vector_patterns = [
+            (r"\\vec\s*\{\s*([^{}]+?)\s*\}", r"\1"),
+            (r"\\vec\s+([A-Za-zА-Яа-я])", r"\1"),
+            (r"\\overrightarrow\s*\{\s*([^{}]+?)\s*\}", r"\1"),
+            (r"\\overleftarrow\s*\{\s*([^{}]+?)\s*\}", r"\1"),
+            (r"\\bar\s*\{\s*([^{}]+?)\s*\}", r"\1"),
+            (r"\\overline\s*\{\s*([^{}]+?)\s*\}", r"\1"),
+            (r"\\widehat\s*\{\s*([^{}]+?)\s*\}", r"\1"),
+            (r"\\hat\s*\{\s*([^{}]+?)\s*\}", r"\1"),
+            (r"\\tilde\s*\{\s*([^{}]+?)\s*\}", r"\1"),
+        ]
+        for pattern, repl in vector_patterns:
+            cleaned = re.sub(pattern, repl, cleaned)
+
+        # На случай если OCR уже превратил \vec{a} в veca / vec a.
+        cleaned = re.sub(r"\bvec\s*([A-Za-zА-Яа-я])\b", r"\1", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bvec([A-Za-zА-Яа-я])\b", r"\1", cleaned, flags=re.IGNORECASE)
 
         # Частые математические знаки.
         replacements = {
-            r"\leqslant": "<=",
-            r"\leq": "<=",
-            r"\le": "<=",
-            r"\geqslant": ">=",
-            r"\geq": ">=",
-            r"\ge": ">=",
-            r"\neq": "!=",
-            r"\ne": "!=",
-            r"\cdot": "*",
-            r"\times": "*",
-            r"\div": "/",
-            r"\pm": "+/-",
-            r"\infty": "∞",
-            r"\circ": "°",
-            r"^\circ": "°",
-            r"^{\circ}": "°",
+            r"\leqslant": "<=", r"\leq": "<=", r"\le": "<=",
+            r"\geqslant": ">=", r"\geq": ">=", r"\ge": ">=",
+            r"\neq": "!=", r"\ne": "!=", r"\equiv": "≡",
+            r"\approx": "≈", r"\sim": "~", r"\simeq": "≈", r"\cong": "≅",
+            r"\cdot": "*", r"\times": "*", r"\div": "/", r"\ast": "*",
+            r"\pm": "+/-", r"\mp": "-/+",
+            r"\infty": "∞", r"\circ": "°", r"\degree": "°",
+            r"\parallel": "∥", r"\perp": "⊥",
+            r"\to": "->", r"\rightarrow": "->", r"\Rightarrow": "=>", r"\Longrightarrow": "=>",
+            r"\leftrightarrow": "<->", r"\Leftrightarrow": "<=>", r"\Longleftrightarrow": "<=>",
+            r"\in": "∈", r"\notin": "∉", r"\ni": "∋",
+            r"\subset": "⊂", r"\subseteq": "⊆", r"\supset": "⊃", r"\supseteq": "⊇",
+            r"\cup": "∪", r"\cap": "∩", r"\setminus": "\\",
+            r"\forall": "∀", r"\exists": "∃", r"\nexists": "∄",
+            r"\emptyset": "∅", r"\varnothing": "∅",
+            r"\ldots": "...", r"\dots": "...", r"\cdots": "...",
         }
-        for src, dst in replacements.items():
+        # Более длинные команды заменяем первыми, чтобы \subseteq не превратился в ⊂eq.
+        for src, dst in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
             cleaned = cleaned.replace(src, dst)
+        cleaned = cleaned.replace("^{\\circ}", "°").replace("^\\circ", "°")
         cleaned = cleaned.replace("^{°}", "°").replace("^°", "°")
 
-        # Греческие буквы, которые часто встречаются в геометрии и параметрах.
+        # Греческие буквы и стандартные обозначения.
         greek = {
-            r"\alpha": "α",
-            r"\beta": "β",
-            r"\gamma": "γ",
-            r"\delta": "δ",
-            r"\varphi": "φ",
-            r"\phi": "φ",
-            r"\pi": "π",
+            r"\alpha": "α", r"\beta": "β", r"\gamma": "γ", r"\delta": "δ",
+            r"\epsilon": "ε", r"\varepsilon": "ε", r"\zeta": "ζ", r"\eta": "η",
+            r"\theta": "θ", r"\vartheta": "θ", r"\iota": "ι", r"\kappa": "κ",
+            r"\lambda": "λ", r"\mu": "μ", r"\nu": "ν", r"\xi": "ξ",
+            r"\rho": "ρ", r"\varrho": "ρ", r"\sigma": "σ", r"\tau": "τ",
+            r"\upsilon": "υ", r"\varphi": "φ", r"\phi": "φ", r"\chi": "χ",
+            r"\psi": "ψ", r"\omega": "ω", r"\pi": "π",
+            r"\Gamma": "Γ", r"\Delta": "Δ", r"\Theta": "Θ", r"\Lambda": "Λ",
+            r"\Xi": "Ξ", r"\Pi": "Π", r"\Sigma": "Σ", r"\Phi": "Φ", r"\Psi": "Ψ", r"\Omega": "Ω",
         }
-        for src, dst in greek.items():
+        for src, dst in sorted(greek.items(), key=lambda item: len(item[0]), reverse=True):
             cleaned = cleaned.replace(src, dst)
 
-        # Углы: \angle C -> угол C.
-        cleaned = re.sub(r"\\angle\s*", "угол ", cleaned)
+        # Множества: \mathbb{R}, \mathbb{N} -> R, N.
+        cleaned = re.sub(r"\\mathbb\s*\{\s*([A-Za-z])\s*\}", r"\1", cleaned)
+        cleaned = re.sub(r"\\mathcal\s*\{\s*([A-Za-z])\s*\}", r"\1", cleaned)
 
-        # Логарифмы: \log_{36} x -> log_36(x), \log_3(x - 1) -> log_3(x - 1).
+        # Углы: \angle C -> угол C, \measuredangle ABC -> угол ABC.
+        cleaned = re.sub(r"\\(?:measuredangle|angle)\s*", "угол ", cleaned)
+
+        # Логарифмы и функции. Делаем до удаления фигурных скобок.
         cleaned = re.sub(r"\\log_\{([^{}]+)\}\s*\(([^()]+)\)", r"log_\1(\2)", cleaned)
         cleaned = re.sub(r"\\log_\{([^{}]+)\}\s*([A-Za-zА-Яа-я0-9]+)", r"log_\1(\2)", cleaned)
-        cleaned = re.sub(r"\\log\s*\(([^()]+)\)", r"log(\1)", cleaned)
-        cleaned = re.sub(r"\\log\s+([A-Za-zА-Яа-я0-9]+)", r"log(\1)", cleaned)
+        cleaned = re.sub(r"\\log_([A-Za-zА-Яа-я0-9]+)\s*\(([^()]+)\)", r"log_\1(\2)", cleaned)
+        cleaned = re.sub(r"\\log_([A-Za-zА-Яа-я0-9]+)\s*([A-Za-zА-Яа-я0-9]+)", r"log_\1(\2)", cleaned)
 
-        # Дроби и корни. Несколько проходов помогают с простыми вложенными выражениями.
-        frac_pattern = re.compile(r"\\(?:dfrac|frac)\{([^{}]+)\}\{([^{}]+)\}")
-        for _ in range(4):
+        trig_and_calc = [
+            "sin", "cos", "tan", "tg", "ctg", "cot", "arcsin", "arccos", "arctan", "arctg",
+            "ln", "lg", "log", "lim", "min", "max", "sup", "inf", "det", "mod",
+        ]
+        for name in trig_and_calc:
+            cleaned = re.sub(rf"\\{name}\b", name, cleaned)
+
+        # Суммы, произведения, пределы и интегралы. Сохраняем смысл в текстовом виде.
+        cleaned = re.sub(r"\\sum_\{([^{}]+)\}\^\{([^{}]+)\}", r"sum(\1..\2)", cleaned)
+        cleaned = re.sub(r"\\sum_([^\s^{}]+)\^\{([^{}]+)\}", r"sum(\1..\2)", cleaned)
+        cleaned = re.sub(r"\\prod_\{([^{}]+)\}\^\{([^{}]+)\}", r"prod(\1..\2)", cleaned)
+        cleaned = re.sub(r"\\int_\{([^{}]+)\}\^\{([^{}]+)\}", r"int_\1^\2", cleaned)
+        cleaned = re.sub(r"\\lim_\{([^{}]+)\}", r"lim_\1", cleaned)
+        cleaned = cleaned.replace(r"\sum", "sum")
+        cleaned = cleaned.replace(r"\prod", "prod")
+        cleaned = cleaned.replace(r"\int", "int")
+        cleaned = cleaned.replace(r"\lim", "lim")
+
+        # Дроби. Несколько проходов закрывают простые вложенные случаи.
+        frac_pattern = re.compile(r"\\(?:dfrac|tfrac|frac)\{([^{}]+)\}\{([^{}]+)\}")
+        for _ in range(8):
             new_cleaned = frac_pattern.sub(r"(\1)/(\2)", cleaned)
             if new_cleaned == cleaned:
                 break
             cleaned = new_cleaned
+
+        # Корни: \sqrt{x}, \sqrt[3]{x}.
+        cleaned = re.sub(r"\\sqrt\[([^\[\]{}]+)\]\{([^{}]+)\}", r"root_\1(\2)", cleaned)
         cleaned = re.sub(r"\\sqrt\{([^{}]+)\}", r"sqrt(\1)", cleaned)
 
-        # Индексы у геометрических точек: A_1 -> A1, B_{1} -> B1.
-        cleaned = re.sub(r"\b([A-ZА-Я])_\{?(\d+)\}?", r"\1\2", cleaned)
+        # Модули и нормы.
+        cleaned = cleaned.replace(r"\lvert", "|").replace(r"\rvert", "|")
+        cleaned = cleaned.replace(r"\left|", "|").replace(r"\right|", "|")
+        cleaned = cleaned.replace(r"\|", "|")
 
-        # Степени: x^{2} -> x^2, 2^{|x|} -> 2^(|x|).
-        cleaned = re.sub(r"\^\{([^{}]+)\}", r"^\1", cleaned)
+        # Индексы и степени: A_1, B_{1}, x^{2}, a_{n+1}.
+        cleaned = re.sub(r"\b([A-Za-zА-Яа-я])_\{([^{}]+)\}", r"\1_\2", cleaned)
+        cleaned = re.sub(r"\b([A-Za-zА-Яа-я])_(\d+)", r"\1_\2", cleaned)
+        cleaned = re.sub(r"([A-Za-zА-Яа-я0-9)\]])\^\{([^{}]+)\}", r"\1^\2", cleaned)
 
-        # Убираем оставшиеся команды LaTeX, но не трогаем обычные слова и знаки.
+        # Для геометрических точек индекс 1 чаще читается лучше без подчёркивания: A_1 -> A1.
+        cleaned = re.sub(r"\b([A-ZА-Я])_(\d+)\b", r"\1\2", cleaned)
+
+        # Скобки LaTeX, которые могли остаться.
+        bracket_replacements = {
+            r"\langle": "<", r"\rangle": ">",
+            r"\lbrace": "{", r"\rbrace": "}",
+            r"\{": "{", r"\}": "}",
+            r"\lceil": "ceil(", r"\rceil": ")",
+            r"\lfloor": "floor(", r"\rfloor": ")",
+        }
+        for src, dst in bracket_replacements.items():
+            cleaned = cleaned.replace(src, dst)
+
+        # Удаляем оставшиеся неизвестные LaTeX-команды максимально мягко:
+        # \abc -> abc, чтобы не терять буквы, но убрать обратный слэш.
         cleaned = re.sub(r"\\([A-Za-zА-Яа-я]+)", r"\1", cleaned)
+
+        # Убираем фигурные скобки, которые остались только как синтаксис.
         cleaned = cleaned.replace("{", "").replace("}", "")
+
+        # Финальная чистка частых следов после удаления команд.
+        cleaned = re.sub(r"\bvec\s*([A-Za-zА-Яа-я])\b", r"\1", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bvec([A-Za-zА-Яа-я])\b", r"\1", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bangle\s+([A-Za-zА-Яа-я0-9]+)", r"угол \1", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("leqslant", "<=").replace("geqslant", ">=")
+        cleaned = cleaned.replace("leq", "<=").replace("geq", ">=")
+        cleaned = cleaned.replace("cdot", "*")
+
+        # Красивые пробелы вокруг операций и знаков сравнения, без агрессивной правки выражений.
+        cleaned = re.sub(r"\s*([<>]=?|!=|=|\+|(?<!\w)-|\*|/)\s*", r" \1 ", cleaned)
+        cleaned = re.sub(r"\s*([∈∉∋⊂⊆⊃⊇∪∩⊥∥≅≡≈])\s*", r" \1 ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:!?°])", r"\1", cleaned)
+        cleaned = re.sub(r"([,.;:!?])(?=[^\s\d])", r"\1 ", cleaned)
+        cleaned = re.sub(r"([(])\s+", r"\1", cleaned)
+        cleaned = re.sub(r"\s+([)])", r"\1", cleaned)
 
         # Чистим пробелы и переносы.
         cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+        cleaned = cleaned.replace(". .", "..")
+        cleaned = re.sub(r"\.\.\s+", "..", cleaned)
         cleaned = cleaned.strip()
         return cleaned
 
