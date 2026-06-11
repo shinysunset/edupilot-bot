@@ -72,7 +72,7 @@ class CognitiveBoundaryManager:
 
     def try_simple_arithmetic(self, text: str) -> tuple[str, float | int | str] | None:
         """Безопасно считает только простые арифметические выражения без переменных."""
-        low = text.lower().strip()
+        low = text.lower().replace("ё", "е").strip()
 
         # Если есть признаки полноценной учебной задачи, уравнения или обхода правил,
         # не считаем напрямую, а отдаём запрос в CBM.
@@ -97,9 +97,24 @@ class CognitiveBoundaryManager:
         for src, dst in replacements.items():
             expr = expr.replace(src, dst)
 
+        # Поддержка самых частых чисел словами: "пять умножить на восемь" -> "5 * 8".
+        number_words = {
+            "ноль": "0", "нуль": "0",
+            "один": "1", "одна": "1", "одно": "1",
+            "два": "2", "две": "2",
+            "три": "3", "четыре": "4", "пять": "5", "шесть": "6",
+            "семь": "7", "восемь": "8", "девять": "9", "десять": "10",
+            "одиннадцать": "11", "двенадцать": "12", "тринадцать": "13",
+            "четырнадцать": "14", "пятнадцать": "15", "шестнадцать": "16",
+            "семнадцать": "17", "восемнадцать": "18", "девятнадцать": "19",
+            "двадцать": "20",
+        }
+        for word, digit in sorted(number_words.items(), key=lambda item: len(item[0]), reverse=True):
+            expr = re.sub(rf"\b{word}\b", digit, expr)
+
         # Убираем служебные слова вокруг выражения.
         expr = re.sub(
-            r"(сколько|будет|чему|равно|посчитай|вычисли|пример|а|ну|пожалуйста|\?)",
+            r"(сколько|будет|чему|равно|посчитай|вычисли|пример|реши|решить|найди|найти|ответ|результат|а|ну|пожалуйста|\?)",
             " ",
             expr,
         )
@@ -158,6 +173,127 @@ class CognitiveBoundaryManager:
             "Если это часть задачи, пришли полное условие, и разберём следующий шаг."
         )
 
+
+    def build_capability_reply(self, text: str) -> str | None:
+        """Локальный ответ на вопросы о возможностях бота без обращения к API."""
+        low = re.sub(r"\s+", " ", text.lower().replace("ё", "е").strip())
+        exact_help = {"помощь", "справка", "help", "/help", "как пользоваться"}
+        patterns = [
+            r"\b(что|че|чо|шо)\s+ты\s+(умеешь|можешь)\s*(делать)?\s*[?.!]*$",
+            r"\b(что|че|чо|шо)\s+(умеешь|можешь)\s*(делать)?\s*[?.!]*$",
+            r"\bчем\s+(ты\s+)?(можешь\s+)?помочь\s*[?.!]*$",
+            r"\b(какие|каковы)\s+(у\s+тебя\s+)?(функции|возможности|команды)\b",
+            r"\b(что\s+можно\s+делать)\b",
+            r"\bкак\s+(с\s+тобой\s+)?(работать|общаться)\b",
+            r"\bкак\s+(ты|бот|edupilot)\s+(работаешь|устроен)\b",
+            r"\bкак\s+работает\s+(бот|edupilot|сервис)\b",
+            r"\bкак\s+пользоваться\s+(тобой|ботом|edupilot|сервисом)\b",
+        ]
+        if low not in exact_help and not any(re.search(pattern, low) for pattern in patterns):
+            return None
+        return (
+            "Я EduPilot, ИИ-репетитор по математике.\n\n"
+            "Что могу:\n"
+            "— объяснить тему или метод решения;\n"
+            "— разобрать задачу по шагам;\n"
+            "— проверить твой ход решения;\n"
+            "— прочитать условие с фото;\n"
+            "— дать подсказку, если ты застрял;\n"
+            "— посчитать простой промежуточный пример вроде 2 + 2.\n\n"
+            "Что не делаю сразу: не выдаю готовое решение всей задачи по просьбе «реши за меня». "
+            "Лучший формат: пришли условие и свой первый шаг, а я помогу дальше."
+        )
+
+    def build_local_teaching_fallback(self, text: str) -> str:
+        """Безопасный резервный ответ, если API недоступен или классификация не сработала."""
+        low = text.lower().replace("ё", "е").strip()
+
+        full_solution_markers = [
+            "реши задачу", "реши пример", "реши уравнение", "реши неравенство", "реши полностью", "дай ответ", "дай только ответ", "без объяснений",
+            "реши за меня", "сделай за меня", "просто реши", "финальный ответ",
+            "сразу ответ", "только ответ",
+        ]
+        if any(marker in low for marker in full_solution_markers):
+            return (
+                "Я не буду сразу давать готовый ответ. "
+                "Давай начнём с первого учебного шага: выпиши, что известно в условии, "
+                "и что нужно найти. Потом я помогу выбрать метод решения."
+            )
+
+        if self.is_injection(text):
+            return (
+                "Я не могу менять роль или обходить правила. "
+                "Я остаюсь ИИ-репетитором: помогу разобраться в задаче, но не буду просто выдавать готовый ответ. "
+                "Напиши, на каком шаге ты застрял."
+            )
+
+        if any(marker in low for marker in ["ошибка", "не работает", "сломался", "почему так", "что случилось"]):
+            return (
+                "Похоже, сейчас произошёл технический сбой при обращении к модели. "
+                "Попробуй переформулировать вопрос или отправить его ещё раз. "
+                "Если это задача по математике, напиши условие и свой первый шаг — я помогу разобрать дальше."
+            )
+
+        if "квадрат" in low and "уравнен" in low:
+            return (
+                "Квадратное уравнение обычно приводят к виду ax^2 + bx + c = 0.\n"
+                "Дальше находят дискриминант: D = b^2 - 4ac.\n"
+                "Если D > 0, будет два корня; если D = 0, один корень; если D < 0, действительных корней нет.\n"
+                "Пришли конкретное уравнение, и я помогу разобрать первый шаг без готового списывания."
+            )
+
+        if "дискриминант" in low:
+            return (
+                "Дискриминант используют в квадратных уравнениях вида ax^2 + bx + c = 0. "
+                "Сначала находят D = b^2 - 4ac, затем по знаку D определяют количество корней. "
+                "Пришли конкретное уравнение, и я помогу начать решение."
+            )
+
+        if "линейн" in low and "уравнен" in low:
+            return (
+                "Линейное уравнение обычно решают так: раскрывают скобки, переносят слагаемые с неизвестной в одну сторону, "
+                "числа в другую, затем делят на коэффициент перед неизвестной. "
+                "Пришли конкретный пример, и разберём следующий шаг."
+            )
+
+        if "логариф" in low:
+            return (
+                "В логарифмических задачах сначала проверяют область допустимых значений, "
+                "затем используют свойства логарифмов и только потом решают полученное уравнение или неравенство. "
+                "Пришли пример, и начнём с ОДЗ."
+            )
+
+        if "тригоном" in low or "sin" in low or "cos" in low or "tg" in low:
+            return (
+                "В тригонометрических задачах сначала приводят выражения к одной функции или используют стандартные формулы. "
+                "Потом находят корни и, если нужно, делают отбор. Пришли условие, и разберём первый шаг."
+            )
+
+        if "процент" in low or "%" in low:
+            return (
+                "В задачах на проценты удобно сначала перевести процент в коэффициент: "
+                "например, рост на r% означает умножение на 1 + r/100. "
+                "Пришли условие, и я помогу составить первое соотношение."
+            )
+
+        if "производн" in low:
+            return (
+                "Для производной сначала определяют, какая функция дана: сумма, произведение, частное или сложная функция. "
+                "Потом применяют нужное правило. Пришли выражение, и разберём первый шаг."
+            )
+
+        if any(word in low for word in ["как решать", "как решить", "объясни", "метод", "разобрать", "не понимаю"]):
+            return (
+                "Я помогу разобраться. Пришли конкретное условие или напиши, какой шаг непонятен. "
+                "Начнём не с готового ответа, а с выбора метода и первого действия."
+            )
+
+        return (
+            "Я могу помочь с математикой, но сейчас не смог корректно обработать запрос через модель. "
+            "Напиши задачу чуть конкретнее: тема, условие и что именно непонятно. "
+            "Если хочешь, пришли фото задачи."
+        )
+
     # ----------------------------------------------------------
     #  Извлечение текста задачи из изображения
     # ----------------------------------------------------------
@@ -194,13 +330,98 @@ class CognitiveBoundaryManager:
         )
         return response.choices[0].message.content.strip()
 
+
+    def normalize_text(self, text: str) -> str:
+        """Нормализует текст для локальных правил классификации."""
+        text = (text or "").lower().replace("ё", "е")
+        text = re.sub(r"[^а-яa-z0-9+\-*/().,%=^\s]", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def detect_intent_by_rules(self, user_message: str, default: str | None = None) -> str | None:
+        """Быстрая локальная проверка очевидных учебных и списывательных запросов.
+
+        Это не заменяет LLM-классификатор из ВКР, а закрывает частые фразы,
+        чтобы бот не падал на простых сценариях вроде «реши задачу» при сбое API.
+        """
+        low = self.normalize_text(user_message)
+        if not low:
+            return default
+
+        if self.is_injection(user_message):
+            return "CHEATING"
+
+        learning_patterns = [
+            r"\b(объясни|разбери|поясни|помоги\s+понять|помоги\s+разобраться)\b",
+            r"\bкак\s+(решать|решить|делать|начать|оформить)\b",
+            r"\b(проверь|проверить|верно\s+ли|правильно\s+ли|где\s+ошибка|что\s+не\s+так)\b",
+            r"\b(я\s+решил|я\s+решила|мой\s+ответ|мое\s+решение|моя\s+попытка)\b",
+            r"\b(подскажи|намекни|первый\s+шаг|следующий\s+шаг|метод|идея\s+решения)\b",
+            r"\b(вместе\s+со\s+мной|со\s+мной|как\s+репетитор)\b",
+            r"\b(почему|зачем|откуда|не\s+понимаю|непонятно)\b",
+        ]
+        if any(re.search(pattern, low) for pattern in learning_patterns):
+            return "LEARNING"
+
+        cheating_patterns = [
+            r"\bреши\b(?!\s+(как|со\s+мной|вместе))",
+            r"\bреши\s+(задачу|пример|уравнение|неравенство|это|ее|её)\b",
+            r"\b(дай|напиши|скажи|покажи|выведи)\s+(готовый\s+)?(ответ|решение|финальный\s+ответ)\b",
+            r"\b(только|просто|сразу)\s+(ответ|решение|результат)\b",
+            r"\b(без\s+объяснений|без\s+рассуждений|не\s+объясняй)\b",
+            r"\b(сделай|выполни)\s+(за\s+меня|полностью|задачу|пример|номер)\b",
+            r"\b(спиши|списать|домашку\s+сделай|дз\s+сделай)\b",
+            r"\b(найди|вычисли|посчитай)\s+(ответ|значение|корни|результат)\b",
+        ]
+        if any(re.search(pattern, low) for pattern in cheating_patterns):
+            return "CHEATING"
+
+        return default
+
+    def build_offline_reply(self, user_message: str, intent: str, attempt: int) -> str:
+        """Резервный ответ без обращения к Groq. Нужен, чтобы пользователь не видел технический сбой."""
+        if intent == "CHEATING":
+            if attempt <= 0:
+                return (
+                    "Я помогу, но не буду решать за тебя с нуля. "
+                    "Пришли полное условие задачи и напиши, что нужно найти. "
+                    "Начнём с первого шага: выделим известные величины и неизвестную."
+                )
+            if attempt == 1:
+                return (
+                    "Дам метод, а не готовый ответ. Сначала определи тип задачи: уравнение, неравенство, проценты, движение, геометрия или другое. "
+                    "После этого выберем стандартный ход решения и запишем первое соотношение."
+                )
+            if attempt == 2:
+                return (
+                    "Покажу первый учебный шаг. Обозначь неизвестную через x, затем выпиши из условия связь между величинами. "
+                    "Не считай до конца: сначала нужно получить правильное уравнение или выражение."
+                )
+            if attempt == 3:
+                return (
+                    "Можно разобрать почти всё решение, но финальный шаг оставим тебе. "
+                    "Пришли условие текстом или фото, и я проведу по шагам до последнего вычисления."
+                )
+            return (
+                "Разберу полностью, если ты уже сделал попытку. "
+                "Пришли условие и свой ход решения, даже если он неправильный. Я поправлю и объясню каждый шаг."
+            )
+
+        local = self.build_local_teaching_fallback(user_message)
+        if "не смог корректно обработать запрос через модель" in local:
+            return (
+                "Я помогу с математикой. Напиши условие задачи, тему и место, где ты застрял. "
+                "Лучший формат: «вот условие, я начал так, дальше не понимаю»."
+            )
+        return local
+
     # ----------------------------------------------------------
     #  LLM-классификатор интентов
     # ----------------------------------------------------------
     def detect_intent(self, user_message: str, history: list) -> str:
-        if self.is_injection(user_message):
-            logging.info("Injection detected by pattern filter")
-            return "CHEATING"
+        local_intent = self.detect_intent_by_rules(user_message)
+        if local_intent is not None:
+            logging.info(f"Intent detected locally: {local_intent}")
+            return local_intent
 
         history_text = ""
         for msg in history[-4:]:
@@ -296,7 +517,12 @@ class CognitiveBoundaryManager:
     def generate_reply(
         self, user_message: str, history: list, attempt: int, forced_intent: str | None = None
     ) -> tuple[str, int, str]:
-        intent = forced_intent if forced_intent is not None else self.detect_intent(user_message, history)
+        try:
+            intent = forced_intent if forced_intent is not None else self.detect_intent(user_message, history)
+        except Exception:
+            logging.exception("Intent detection error")
+            intent = self.detect_intent_by_rules(user_message, default="LEARNING") or "LEARNING"
+
         logging.info(f"Intent={intent}  attempt={attempt}")
 
         new_attempt = (attempt + 1) if intent == "CHEATING" else 0
@@ -307,13 +533,20 @@ class CognitiveBoundaryManager:
         messages.append({"role": "user", "content": user_message})
 
         is_early_cheating = intent == "CHEATING" and attempt < 4
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            temperature=0.2 if is_early_cheating else 0.7,
-            max_tokens=350 if is_early_cheating else 1024,
-        )
-        return resp.choices[0].message.content, new_attempt, intent
+        try:
+            resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.2 if is_early_cheating else 0.7,
+                max_tokens=350 if is_early_cheating else 1024,
+            )
+            reply = (resp.choices[0].message.content or "").strip()
+            if not reply:
+                raise RuntimeError("Empty model reply")
+            return reply, new_attempt, intent
+        except Exception:
+            logging.exception("Generation error")
+            return self.build_offline_reply(user_message, intent, attempt), new_attempt, intent
 
     def build_photo_guidance_reply(self, task_text: str, caption: str, attempt: int) -> str:
         """Безопасный первый ответ на фото-задачу: не даёт готовое решение сразу."""
@@ -438,6 +671,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_state(uid)
     user_message = update.message.text
 
+    capability_reply = manager.build_capability_reply(user_message)
+    if capability_reply is not None:
+        user_attempts[uid] = 0
+        user_stats[uid]["learning"] += 1
+        user_histories[uid].append({"role": "user", "content": user_message})
+        user_histories[uid].append({"role": "assistant", "content": capability_reply})
+        if len(user_histories[uid]) > 20:
+            user_histories[uid] = user_histories[uid][-20:]
+        await update.message.reply_text(capability_reply)
+        return
+
     simple_reply = manager.build_simple_arithmetic_reply(user_message)
     if simple_reply is not None:
         user_attempts[uid] = 0
@@ -463,9 +707,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(user_histories[uid]) > 20:
             user_histories[uid] = user_histories[uid][-20:]
         await update.message.reply_text(reply)
-    except Exception as e:
-        logging.error(f"Text error: {e}")
-        await update.message.reply_text("Произошла ошибка. Попробуй ещё раз.")
+    except Exception:
+        logging.exception("Text handling error")
+        fallback_reply = manager.build_local_teaching_fallback(user_message)
+        low = user_message.lower().replace("ё", "е")
+        fallback_cheating_markers = [
+            "реши задачу", "реши пример", "реши уравнение", "реши неравенство", "реши полностью", "дай ответ", "дай только ответ", "без объяснений",
+            "реши за меня", "сделай за меня", "просто реши", "финальный ответ",
+            "сразу ответ", "только ответ",
+        ]
+        intent = (
+            "CHEATING"
+            if manager.is_injection(user_message) or any(marker in low for marker in fallback_cheating_markers)
+            else "LEARNING"
+        )
+        if intent == "CHEATING":
+            user_attempts[uid] += 1
+            user_stats[uid]["cheating"] += 1
+        else:
+            user_attempts[uid] = 0
+            user_stats[uid]["learning"] += 1
+        user_histories[uid].append({"role": "user", "content": user_message})
+        user_histories[uid].append({"role": "assistant", "content": fallback_reply})
+        if len(user_histories[uid]) > 20:
+            user_histories[uid] = user_histories[uid][-20:]
+        await update.message.reply_text(fallback_reply)
 
 
 # ==============================================================
@@ -545,8 +811,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_histories[uid] = user_histories[uid][-20:]
         await update.message.reply_text(reply)
 
-    except Exception as e:
-        logging.error(f"Photo error: {e}")
+    except Exception:
+        logging.exception("Photo handling error")
         await update.message.reply_text(
             "Не смог прочитать задачу с фото 😔\n"
             "Попробуй сделать фото чётче или напиши задачу текстом."
