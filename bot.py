@@ -19,12 +19,20 @@ from telegram.ext import (
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-client = Groq(api_key=GROQ_API_KEY)
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def get_groq_client() -> Groq:
+    """Возвращает Groq client или понятную ошибку, если ключ не задан."""
+    if client is None:
+        raise RuntimeError("GROQ_AUTH_FAILED: GROQ_API_KEY is not set")
+    return client
+
 
 BOT_VERSION = "2026-06-11-math-symbols-v2"
 TELEGRAM_MESSAGE_LIMIT = 3900
@@ -71,6 +79,11 @@ class CognitiveBoundaryManager:
         r"новая\s+(роль|инструкция|задача\s+для\s+тебя)",
         r"act\s+as\b",
         r"ignore.{0,40}(previous|instruction|prompt|rules)",
+        r"выведи.{0,40}(системн|промпт|инструкц|правил)",
+        r"покажи.{0,40}(системн|промпт|инструкц|правил)",
+        r"не\s+соблюдай.{0,40}(cbm|правил|инструкц|огранич)",
+        r"с\s+этого\s+момента.{0,60}(обычный|chatgpt|решатель|калькулятор)",
+        r"приказ.{0,40}(администратор|admin)",
         r"pretend\s+to\s+be",
         r"притворись",
         r"представь\s+(что\s+ты|себя)",
@@ -144,7 +157,7 @@ class CognitiveBoundaryManager:
     def _safe_eval_arithmetic(self, expr: str) -> float | int | str | None:
         if not re.fullmatch(r"[0-9+\-*/().\s]+", expr):
             return None
-        if not re.search(r"\d\s*[+\-*/]\s*\d", expr):
+        if not re.search(r"\d\s*[+\-*/]\s*[+\-]?\d", expr):
             return None
         try:
             tree = ast.parse(expr, mode="eval")
@@ -197,8 +210,15 @@ class CognitiveBoundaryManager:
             "tg",
             "забудь",
             "игнорируй",
+            "почему",
+            "объясни",
+            "как",
         ]
         if any(marker in low for marker in blocked_markers):
+            return None
+        # Не превращаем учебные выражения с переменными в ложную арифметику:
+        # "2x + 5 = 17" не должно становиться "2 + 5 = 17".
+        if re.search(r"\d\s*[a-zA-ZхХуУ]|[a-zA-ZхХуУ]\s*\d", low):
             return None
         if re.search(r"[a-zа-я]\s*=|=\s*[a-zа-я]", low):
             return None
@@ -209,7 +229,7 @@ class CognitiveBoundaryManager:
         # Убираем вводные слова перед простой проверкой вычисления: "Проверь: 7 * 8 = 54?".
         # Это не меняет логику CBM, а только позволяет безопасно проверить короткую арифметику.
         normalized = re.sub(
-            r"\b(проверь|проверить|верно\s+ли|правильно\s+ли|посчитай|вычисли|сколько|чему\s+равно)\b\s*[:,-]?\s*",
+            r"\b(проверь|проверить|верно\s+ли|правильно\s+ли|посчитай|вычисли|сколько|чему\s+равно)\b\s*(?::|,|-\s)?\s*",
             " ",
             normalized,
         )
@@ -360,7 +380,7 @@ class CognitiveBoundaryManager:
             "Пиши обычным текстом: угол C, 7/25, log_36(x), <=, >=, *, sqrt(x), root(5, x), векторы a и b. "
             "Не добавляй фразу 'на изображении'. Не решай задачу."
         )
-        response = client.chat.completions.create(
+        response = get_groq_client().chat.completions.create(
             model=model,
             messages=[
                 {
@@ -726,9 +746,11 @@ class CognitiveBoundaryManager:
         cheating_patterns = [
             r"\bреши\b(?!\s+(как|со\s+мной|вместе))",
             r"\b(дай|напиши|скажи|покажи)\s+(готовый\s+)?(ответ|решение|финальный\s+ответ)\b",
-            r"\b(только|просто|сразу)\s+(ответ|решение|результат)\b",
+            r"\b(только|просто|сразу)\s+(финальный\s+)?(ответ|решение|результат)\b",
             r"\b(без\s+объяснений|без\s+рассуждений|не\s+объясняй)\b",
             r"\b(сделай|выполни)\s+(за\s+меня|полностью|задачу|пример|номер)\b",
+            r"\bнайди\s+[a-zа-я0-9]",
+            r"\bучитель\s+не\s+узнает\b",
             r"\b(спиши|списать|домашку\s+сделай|дз\s+сделай)\b",
         ]
         if any(re.search(pattern, low) for pattern in cheating_patterns):
@@ -763,7 +785,7 @@ LEARNING — студент задаёт учебный вопрос, проси
 
 Только одно слово:"""
 
-        response = client.chat.completions.create(
+        response = get_groq_client().chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
@@ -842,7 +864,7 @@ LEARNING — студент задаёт учебный вопрос, проси
 
         is_early_cheating = intent == "CHEATING" and attempt < 4
         try:
-            response = client.chat.completions.create(
+            response = get_groq_client().chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=messages,
                 temperature=0.2 if is_early_cheating else 0.5,
@@ -895,7 +917,7 @@ LEARNING — студент задаёт учебный вопрос, проси
 4. Ответ должен быть конкретным именно для этой задачи.
 5. Формулы пиши простым текстом без LaTeX и markdown."""
         try:
-            response = client.chat.completions.create(
+            response = get_groq_client().chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
                     {"role": "system", "content": system_prompt},
