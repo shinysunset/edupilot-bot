@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2026-06-11-cbm-stable-v2"
+BOT_VERSION = "2026-06-11-final-polished"
 TELEGRAM_MESSAGE_LIMIT = 3900
 
 
@@ -349,7 +349,8 @@ class CognitiveBoundaryManager:
             "Если видно несколько задач, выбери ту, которая занимает основную часть изображения или выделена ближе всего к центру.\n"
             "Если часть текста неразборчива, напиши [неразборчиво] только в этом месте и сохрани всё, что читается.\n"
             "Если невозможно прочитать даже смысл условия, верни ровно OCR_FAILED.\n"
-            "Не используй markdown. Не добавляй фразу 'на изображении'. Не решай задачу."
+            "Не используй markdown. Не используй LaTeX-синтаксис: не пиши $, \\angle, \\frac, \\cdot, \\leqslant, \\geqslant. "
+            "Пиши обычным текстом: угол C, 7/25, log_36(x), <=, >=, *. Не добавляй фразу 'на изображении'. Не решай задачу."
         )
         response = client.chat.completions.create(
             model=model,
@@ -369,6 +370,98 @@ class CognitiveBoundaryManager:
             max_tokens=2048,
         )
         return (response.choices[0].message.content or "").strip()
+
+    def clean_ocr_text(self, text: str) -> str:
+        """Аккуратно убирает LaTeX-мусор из OCR, не меняя смысл задачи."""
+        if not text:
+            return text
+
+        cleaned = text.strip()
+
+        # Убираем математические разделители, которые модель иногда оставляет из LaTeX.
+        cleaned = cleaned.replace("\\(", "").replace("\\)", "")
+        cleaned = cleaned.replace("\\[", "").replace("\\]", "")
+        cleaned = cleaned.replace("$", "")
+
+        # Окружения систем уравнений переводим в обычный текст.
+        cleaned = re.sub(r"\\begin\{cases\}", "система:\n", cleaned)
+        cleaned = re.sub(r"\\end\{cases\}", "", cleaned)
+        cleaned = cleaned.replace("\\\\", "\n")
+
+        # Команды оформления.
+        cleaned = cleaned.replace("\\left", "").replace("\\right", "")
+        cleaned = cleaned.replace("\\,", " ").replace("\\;", " ").replace("\\:", " ")
+
+        # Частые математические знаки.
+        replacements = {
+            r"\leqslant": "<=",
+            r"\leq": "<=",
+            r"\le": "<=",
+            r"\geqslant": ">=",
+            r"\geq": ">=",
+            r"\ge": ">=",
+            r"\neq": "!=",
+            r"\ne": "!=",
+            r"\cdot": "*",
+            r"\times": "*",
+            r"\div": "/",
+            r"\pm": "+/-",
+            r"\infty": "∞",
+            r"\circ": "°",
+            r"^\circ": "°",
+            r"^{\circ}": "°",
+        }
+        for src, dst in replacements.items():
+            cleaned = cleaned.replace(src, dst)
+        cleaned = cleaned.replace("^{°}", "°").replace("^°", "°")
+
+        # Греческие буквы, которые часто встречаются в геометрии и параметрах.
+        greek = {
+            r"\alpha": "α",
+            r"\beta": "β",
+            r"\gamma": "γ",
+            r"\delta": "δ",
+            r"\varphi": "φ",
+            r"\phi": "φ",
+            r"\pi": "π",
+        }
+        for src, dst in greek.items():
+            cleaned = cleaned.replace(src, dst)
+
+        # Углы: \angle C -> угол C.
+        cleaned = re.sub(r"\\angle\s*", "угол ", cleaned)
+
+        # Логарифмы: \log_{36} x -> log_36(x), \log_3(x - 1) -> log_3(x - 1).
+        cleaned = re.sub(r"\\log_\{([^{}]+)\}\s*\(([^()]+)\)", r"log_\1(\2)", cleaned)
+        cleaned = re.sub(r"\\log_\{([^{}]+)\}\s*([A-Za-zА-Яа-я0-9]+)", r"log_\1(\2)", cleaned)
+        cleaned = re.sub(r"\\log\s*\(([^()]+)\)", r"log(\1)", cleaned)
+        cleaned = re.sub(r"\\log\s+([A-Za-zА-Яа-я0-9]+)", r"log(\1)", cleaned)
+
+        # Дроби и корни. Несколько проходов помогают с простыми вложенными выражениями.
+        frac_pattern = re.compile(r"\\(?:dfrac|frac)\{([^{}]+)\}\{([^{}]+)\}")
+        for _ in range(4):
+            new_cleaned = frac_pattern.sub(r"(\1)/(\2)", cleaned)
+            if new_cleaned == cleaned:
+                break
+            cleaned = new_cleaned
+        cleaned = re.sub(r"\\sqrt\{([^{}]+)\}", r"sqrt(\1)", cleaned)
+
+        # Индексы у геометрических точек: A_1 -> A1, B_{1} -> B1.
+        cleaned = re.sub(r"\b([A-ZА-Я])_\{?(\d+)\}?", r"\1\2", cleaned)
+
+        # Степени: x^{2} -> x^2, 2^{|x|} -> 2^(|x|).
+        cleaned = re.sub(r"\^\{([^{}]+)\}", r"^\1", cleaned)
+
+        # Убираем оставшиеся команды LaTeX, но не трогаем обычные слова и знаки.
+        cleaned = re.sub(r"\\([A-Za-zА-Яа-я]+)", r"\1", cleaned)
+        cleaned = cleaned.replace("{", "").replace("}", "")
+
+        # Чистим пробелы и переносы.
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+        cleaned = cleaned.strip()
+        return cleaned
 
     def is_bad_ocr_result(self, text: str) -> bool:
         cleaned = (text or "").strip()
@@ -403,7 +496,9 @@ class CognitiveBoundaryManager:
             try:
                 logger.info("OCR attempt with model=%s image_bytes=%s", model, len(image_bytes))
                 text = self._call_vision_ocr(image_bytes, model=model)
-                logger.info("OCR result with model=%s length=%s preview=%r", model, len(text), text[:160])
+                logger.info("OCR raw result with model=%s length=%s preview=%r", model, len(text), text[:160])
+                text = self.clean_ocr_text(text)
+                logger.info("OCR cleaned result with model=%s length=%s preview=%r", model, len(text), text[:160])
                 if not self.is_bad_ocr_result(text):
                     return text
                 last_text = text
@@ -813,17 +908,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_attempts[uid] = 0
     user_stats[uid] = {"cheating": 0, "learning": 0}
     pending_tasks.pop(uid, None)
-    await update.message.reply_text(
-        "👋 Привет! Я EduPilot — твой ИИ-репетитор по математике.\n\n"
-        "Я помогу разобраться с задачами, но решать за тебя не буду 😏\n"
-        "Задавай вопросы или присылай фото задачи — разберём вместе!\n\n"
-        "📌 Команды:\n"
-        "/start — начать заново\n"
-        "/help — как я работаю\n"
-        "/stats — твоя статистика\n"
-        "/level — текущий уровень подсказки\n"
-        "/version — версия кода",
-    )
+    start_text = """✨ Привет! Я EduPilot: твой ИИ-тьютор по математике.
+
+Я превращаю задачу в понятный маршрут:
+📷 считываю условие с изображения;
+📝 разбираю данные и вопрос;
+💡 подсказываю идею решения;
+✅ проверяю твои рассуждения;
+📈 отслеживаю рост самостоятельности.
+
+Каждый разбор строится по шагам: от понимания условия к методу, от метода к первому действию, от первого действия к уверенному решению.
+
+Лучший формат:
+«Вот задача. Я сделал ..., но не понимаю следующий шаг».
+
+Команды:
+/start — новый диалог
+/help — инструкция
+/stats — статистика
+/level — уровень подсказки"""
+    await update.message.reply_text(start_text)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -837,9 +941,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Лучший формат: «вот условие, я начал так, дальше не понимаю»."
     )
 
-
-async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"EduPilot version: {BOT_VERSION}")
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1035,8 +1136,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("level", level_cmd))
-    app.add_handler(CommandHandler("version", version_cmd))
-
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document_image))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
