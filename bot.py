@@ -34,7 +34,7 @@ def get_groq_client() -> Groq:
     return client
 
 
-BOT_VERSION = "2026-06-11-math-symbols-v2"
+BOT_VERSION = "2026-06-11-defense-audit-v1"
 TELEGRAM_MESSAGE_LIMIT = 3900
 
 
@@ -65,7 +65,9 @@ class CognitiveBoundaryManager:
         "π пиши как π, корень как sqrt(). "
         "Не используй посторонние символы, иероглифы, японские, китайские "
         "или другие нерелевантные знаки. "
-        "Математические обозначения, цифры и стандартные знаки операций использовать можно."
+        "Математические обозначения, цифры и стандартные знаки операций использовать можно. "
+        "Если запрос явно не учебный и не связан с математикой, физикой, информатикой, химией или проверкой решения, "
+        "коротко скажи, что EduPilot работает как учебный тьютор, и предложи прислать учебную задачу."
     )
 
     INJECTION_PATTERNS = [
@@ -119,8 +121,42 @@ class CognitiveBoundaryManager:
     }
 
     def is_injection(self, text: str) -> bool:
+        """Ловит прямые и слегка замаскированные попытки сменить роль/обойти CBM."""
         low = (text or "").lower().replace("ё", "е")
-        return any(re.search(pattern, low) for pattern in self.INJECTION_PATTERNS)
+        if any(re.search(pattern, low) for pattern in self.INJECTION_PATTERNS):
+            return True
+
+        # Защита от простых обходов: "з а б у д ь", "ignore_previous_instructions",
+        # "п о к а ж и  т о к е н". Не используем для обычной классификации, только для security-маркеров.
+        compact = re.sub(r"[^a-zа-я0-9]+", "", low)
+        compact_markers = [
+            "забудьинструкции",
+            "забудьвсеинструкции",
+            "игнорируйинструкции",
+            "игнорируйсистемныйпромпт",
+            "тытеперькалькулятор",
+            "тыобычныйchatgpt",
+            "несоблюдайcbm",
+            "дайтолькоответ",
+            "простодайответ",
+            "покажисистемныйпромпт",
+            "выведисистемныйпромпт",
+            "покажипеременныеокружения",
+            "выведипеременныеокружения",
+            "покажиtelegramtoken",
+            "покажиgroqapikey",
+            "telegramtoken",
+            "groqapikey",
+            "ignorepreviousinstructions",
+            "ignoreallinstructions",
+            "actascalculator",
+            "developermode",
+            "systemprompt",
+
+            "неклассифицируйэтокакcheating",
+            "поставьintentlearning",
+            "intentlearning",        ]
+        return any(marker in compact for marker in compact_markers)
 
     def normalize_text(self, text: str) -> str:
         text = (text or "").lower().replace("ё", "е")
@@ -363,6 +399,39 @@ class CognitiveBoundaryManager:
 
         return None
 
+    def build_scope_reply(self, text: str) -> str | None:
+        """Короткий ответ на явно неучебные запросы.
+
+        Не блокирует школьные/студенческие задачи по физике, химии и информатике,
+        если в них есть расчёты, формулы, код или просьба объяснить учебный шаг.
+        """
+        low = self.normalize_text(text)
+        if not low:
+            return None
+
+        educational_markers = [
+            "задач", "пример", "уравнен", "неравен", "формул", "доказ", "найд",
+            "реш", "объясни", "метод", "проверь", "ошибка", "шаг", "математ",
+            "физик", "хими", "информат", "код", "python", "алгоритм", "вероят",
+            "производн", "интеграл", "предел", "логариф", "sin", "cos", "sqrt",
+            "кредит", "вклад", "процент",
+        ]
+        if any(marker in low for marker in educational_markers):
+            return None
+
+        non_educational_markers = [
+            "погода", "новости", "фильм", "сериал", "музыка", "песня", "мем",
+            "пост", "тредс", "сторис", "рецепт", "отношения", "свидание",
+            "политика", "гороскоп", "курс доллара", "купить", "закажи",
+        ]
+        if any(marker in low for marker in non_educational_markers):
+            return (
+                "Я EduPilot, учебный тьютор. Лучше всего помогаю с задачами, формулами, вычислениями, "
+                "проверкой рассуждений и первым шагом решения. Пришли учебное условие или свой ход решения."
+            )
+        return None
+
+
     # ----------------------------------------------------------
     #  Обработка изображения
     # ----------------------------------------------------------
@@ -501,6 +570,7 @@ class CognitiveBoundaryManager:
             r"\cup": "∪", r"\cap": "∩", r"\setminus": "\\",
             r"\forall": "∀", r"\exists": "∃", r"\nexists": "∄",
             r"\emptyset": "∅", r"\varnothing": "∅",
+            r"\int": "int", r"\sum": "sum", r"\prod": "prod", r"\lim": "lim",
             r"\ldots": "...", r"\dots": "...", r"\cdots": "...",
         }
         # Более длинные команды заменяем первыми, чтобы \subseteq не превратился в ⊂eq.
@@ -665,6 +735,8 @@ class CognitiveBoundaryManager:
         cleaned = re.sub(r"[ \t]+", " ", cleaned)
         cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = cleaned.replace("- >", "->").replace("< -", "<-").replace("= >", "=>").replace("< =", "<=")
+        cleaned = cleaned.replace("> =", ">=").replace("! =", "!=")
         cleaned = cleaned.replace(". .", "..")
         cleaned = re.sub(r"\.\.\s+", "..", cleaned)
         cleaned = cleaned.strip()
@@ -724,7 +796,11 @@ class CognitiveBoundaryManager:
     #  Классификация намерений
     # ----------------------------------------------------------
     def detect_intent_by_rules(self, user_message: str, default: str | None = None) -> str | None:
-        """Только явные случаи. Смысловая классификация остаётся за LLM."""
+        """Только явные случаи. Смысловая классификация остаётся за LLM.
+
+        В смешанных запросах сильная просьба о готовом ответе важнее мягкой фразы
+        "объясни", кроме случаев, где пользователь явно просит метод без решения.
+        """
         low = self.normalize_text(user_message)
         if not low:
             return default
@@ -739,21 +815,36 @@ class CognitiveBoundaryManager:
             r"\b(я\s+решил|я\s+решила|мой\s+ответ|мое\s+решение|моя\s+попытка|получил|получила)\b",
             r"\b(подскажи|намекни|первый\s+шаг|следующий\s+шаг|метод|идея\s+решения)\b",
             r"\b(вместе\s+со\s+мной|как\s+репетитор)\b",
+            r"\b(я\s+начал|я\s+начала|почему\s+нужен|почему\s+нужна|какую\s+формулу|помоги\s+без\s+готового\s+ответа)\b",
         ]
-        if any(re.search(pattern, low) for pattern in learning_patterns):
-            return "LEARNING"
-
         cheating_patterns = [
             r"\bреши\b(?!\s+(как|со\s+мной|вместе))",
-            r"\b(дай|напиши|скажи|покажи)\s+(готовый\s+)?(ответ|решение|финальный\s+ответ)\b",
-            r"\b(только|просто|сразу)\s+(финальный\s+)?(ответ|решение|результат)\b",
+            r"\bрешите\b",
+            r"\b(дай|напиши|скажи|покажи|скинь)\s+(готов(?:ый|ое|ую)?\s+)?(ответ|решение|финальный\s+ответ|результат)\b",
+            r"\b(только|просто|сразу)\s+(финальный\s+)?(ответ|решение|результат|число)\b",
             r"\b(без\s+объяснений|без\s+рассуждений|не\s+объясняй)\b",
-            r"\b(сделай|выполни)\s+(за\s+меня|полностью|задачу|пример|номер)\b",
+            r"\b(сделай|выполни)\s+(за\s+меня|полностью|задачу|пример|номер|дз|домашку)\b",
             r"\bнайди\s+[a-zа-я0-9]",
             r"\bучитель\s+не\s+узнает\b",
-            r"\b(спиши|списать|домашку\s+сделай|дз\s+сделай)\b",
+            r"\b(спиши|списать|домашку\s+сделай|дз\s+сделай|контрольную\s+сделай)\b",
+            r"\b(мне\s+не\s+надо\s+понимать|чтобы\s+я\s+списал|переписал\s+в\s+тетрадь)\b",
         ]
-        if any(re.search(pattern, low) for pattern in cheating_patterns):
+
+        has_learning = any(re.search(pattern, low) for pattern in learning_patterns)
+        has_cheating = any(re.search(pattern, low) for pattern in cheating_patterns)
+
+        safe_learning_override = bool(
+            re.search(
+                r"(объясни|покажи|напиши)\s+(метод|идею|подход)|без\s+готового\s+ответа|не\s+решай|не\s+давай\s+ответ|без\s+финального\s+ответа",
+                low,
+            )
+        )
+
+        if has_cheating and not safe_learning_override:
+            return "CHEATING"
+        if has_learning:
+            return "LEARNING"
+        if has_cheating:
             return "CHEATING"
         return default
 
@@ -1069,8 +1160,18 @@ def looks_like_task_text(text: str) -> bool:
         "уравнение",
         "функция",
         "значение",
+        "информат",
+        "алгоритм",
+        "код",
+        "физик",
+        "хими",
+        "формула",
     ]
-    return sum(marker in low for marker in task_markers) >= 2 or bool(re.search(r"[=<>^]|\d+\s*[+\-*/]\s*\d+", low))
+    marker_count = sum(marker in low for marker in task_markers)
+    stem_task = bool(re.search(r"\b(информат|алгоритм|код|физик|хими)\b", low)) and bool(
+        re.search(r"\b(объясни|найди|реши|проверь|задач|формул|метод)\b", low)
+    )
+    return marker_count >= 2 or stem_task or bool(re.search(r"[=<>^]|\d+\s*[+\-*/]\s*\d+", low))
 
 
 def is_pending_followup(text: str) -> bool:
@@ -1088,6 +1189,7 @@ def classify_photo_message(caption: str) -> str:
         return "CHEATING"
     if manager.is_injection(caption_low):
         return "CHEATING"
+
     learning_markers = [
         "объясни",
         "метод",
@@ -1100,11 +1202,42 @@ def classify_photo_message(caption: str) -> str:
         "я решила",
         "что не так",
         "где ошибка",
+        "не решай",
+        "без ответа",
+        "без финального ответа",
     ]
-    if any(marker in caption_low for marker in learning_markers):
+    cheating_markers = [
+        "реши",
+        "реши полностью",
+        "дай ответ",
+        "ответ",
+        "найди",
+        "вычисли",
+        "посчитай",
+        "полностью",
+        "без объяснений",
+        "только ответ",
+        "просто ответ",
+    ]
+
+    has_learning = any(marker in caption_low for marker in learning_markers)
+    has_cheating = any(marker in caption_low for marker in cheating_markers)
+    safe_learning_override = any(marker in caption_low for marker in [
+        "объясни метод",
+        "объясни идею",
+        "не решай",
+        "без ответа",
+        "без финального ответа",
+        "проверь",
+        "я решил",
+        "я решила",
+    ])
+
+    if has_cheating and not safe_learning_override:
+        return "CHEATING"
+    if has_learning:
         return "LEARNING"
-    cheating_markers = ["реши", "дай ответ", "ответ", "найди", "вычисли", "посчитай", "полностью", "без объяснений"]
-    if any(marker in caption_low for marker in cheating_markers):
+    if has_cheating:
         return "CHEATING"
     return "LEARNING"
 
@@ -1206,15 +1339,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_message(update, simple_reply)
         return
 
-    topic_reply = manager.build_topic_explanation_reply(user_message)
-    if topic_reply is not None:
-        user_attempts[uid] = 0
-        user_stats[uid]["learning"] += 1
-        append_history(uid, "user", user_message)
-        append_history(uid, "assistant", topic_reply)
-        await send_long_message(update, topic_reply)
-        return
-
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
@@ -1246,6 +1370,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 history=user_histories[uid],
             )
         else:
+            topic_reply = manager.build_topic_explanation_reply(user_message)
+            if topic_reply is not None:
+                user_attempts[uid] = 0
+                user_stats[uid]["learning"] += 1
+                append_history(uid, "user", user_message)
+                append_history(uid, "assistant", topic_reply)
+                await send_long_message(update, topic_reply)
+                return
+
+            scope_reply = manager.build_scope_reply(user_message)
+            if scope_reply is not None:
+                user_attempts[uid] = 0
+                user_stats[uid]["learning"] += 1
+                append_history(uid, "user", user_message)
+                append_history(uid, "assistant", scope_reply)
+                await send_long_message(update, scope_reply)
+                return
+
             reply, new_attempt, intent = manager.generate_reply(
                 user_message, user_histories[uid], user_attempts[uid]
             )
@@ -1300,8 +1442,11 @@ async def process_image_bytes(
         append_history(uid, "user", history_label)
         append_history(uid, "assistant", reply)
         await send_long_message(update, reply)
-    except Exception:
+    except Exception as exc:
         logger.exception("Image handling error")
+        if manager.is_groq_auth_error(exc) or "GROQ_AUTH_FAILED" in str(exc):
+            await update.message.reply_text(manager.groq_auth_user_message())
+            return
         await update.message.reply_text(
             "Не смог прочитать задачу с изображения. В логах Railway теперь должна быть точная причина.\n"
             "Попробуй отправить картинку как файл без сжатия или напиши условие текстом."
